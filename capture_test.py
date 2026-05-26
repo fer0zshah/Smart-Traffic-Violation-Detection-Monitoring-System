@@ -2,7 +2,7 @@ import cv2
 import os
 
 # 1. Place a sample traffic video in your E:\ISDIOT folder and name it 'traffic.mp4'
-video_source = "t.mp4" 
+video_source = "traffic.mp4" 
 
 # Check if the file exists before trying to open it
 if not os.path.exists(video_source):
