@@ -46,7 +46,7 @@ REAL_DISTANCE_METERS = 3.0
 # PIXELS_PER_METER = 100  # example: 100 pixels = 1 meter
 # REAL_DISTANCE_METERS = abs(LINE_LOWER_Y - LINE_UPPER_Y) / PIXELS_PER_METER
 
-
+SPEED_LIMIT_KMH = 60.0
 VIDEO_FPS = 30.0
 MIN_FRAMES_VALID = 3
 DIRECTION_FRAMES = 3
@@ -305,7 +305,7 @@ class SpeedEstimator:
         time_s = frames / self.fps
         speed_ms = self.real_distance_m / time_s
         speed_kmh = round(speed_ms * 3.6, 1)
-       
+        violation = speed_kmh > self.speed_limit
         
         measurement = SpeedMeasurement(
             track_id=track_id,
@@ -347,7 +347,35 @@ class SpeedEstimator:
             return self._tracks[track_id].get("direction")
         return None
     
-    
+    def get_summary(self) -> dict:
+        total = len(self.measurements)
+        violations = sum(1 for m in self.measurements if m.violation)
+        avg_speed = sum(m.speed_kmh for m in self.measurements) / total if total else 0
+        up = sum(1 for m in self.measurements if m.direction == "up")
+        down = sum(1 for m in self.measurements if m.direction == "down")
+        
+        return {
+            "total_valid": total,
+            "up_count": up,
+            "down_count": down,
+            "discarded": self.discarded_count,
+            "violations": violations,
+            "average_speed": round(avg_speed, 1),
+            "speed_limit": self.speed_limit,
+            "real_distance_m": self.real_distance_m,
+            "pixels_per_meter": round(self.pixels_per_meter, 1),
+            "measurements": [
+                {
+                    "track_id": m.track_id,
+                    "direction": m.direction,
+                    "speed_kmh": m.speed_kmh,
+                    "violation": m.violation,
+                    "frames": m.frames_between,
+                    "time_s": m.time_seconds,
+                }
+                for m in self.measurements
+            ]
+        }
 
 
 def resize_for_display(frame, target_width=1280):
