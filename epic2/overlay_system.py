@@ -91,3 +91,93 @@ class OcclusionTracker:
         
         tracked.tracker_id = new_consistent_ids
         return tracked
+  def _try_reassign(self, cx, cy, frame_num):
+        best_match = None
+        best_dist = float('inf')
+        
+        for gid, ghost in self.ghost_tracks.items():
+            if frame_num - ghost["lost_frame"] > 15:
+                continue
+            
+            gx, gy = ghost["last_pos"]
+            dist = math.sqrt((float(cx) - gx)**2 + (float(cy) - gy)**2)
+            
+            if dist < 80 and dist < best_dist:
+                best_dist = dist
+                best_match = gid
+        
+        if best_match is not None:
+            del self.ghost_tracks[best_match]
+            return best_match
+        
+        return None
+    
+    def _clean_ghosts(self, frame_num):
+        to_remove = []
+        for gid, ghost in self.ghost_tracks.items():
+            if frame_num - ghost["lost_frame"] > 15:
+                to_remove.append(gid)
+        for gid in to_remove:
+            del self.ghost_tracks[gid]
+
+
+class OverlayRenderer:
+    """Handles all visual overlays for the detection system."""
+    
+    def __init__(self, show_overlay=True):
+        self.show_overlay = show_overlay
+        self.box_annotator = sv.BoxAnnotator(thickness=2)
+        self.label_annotator = sv.LabelAnnotator(text_thickness=2, text_scale=0.6)
+        self.trace_annotator = sv.TraceAnnotator(thickness=2, trace_length=50)
+        
+    def draw_virtual_lines(self, frame, frame_width):
+        """Draw speed measurement and stop lines."""
+        if not self.show_overlay:
+            return frame
+            
+        annotated = frame.copy()
+        
+        # Speed measurement lines
+        cv2.line(annotated, (0, SPEED_LINE_1_Y), (frame_width, SPEED_LINE_1_Y), 
+                SPEED_LINE_COLOR, LINE_THICKNESS)
+        cv2.line(annotated, (0, SPEED_LINE_2_Y), (frame_width, SPEED_LINE_2_Y), 
+                SPEED_LINE_COLOR, LINE_THICKNESS)
+        
+        # Labels for speed lines
+        cv2.putText(annotated, "SPEED LINE 1", (10, SPEED_LINE_1_Y - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, SPEED_LINE_COLOR, 1)
+        cv2.putText(annotated, "SPEED LINE 2", (10, SPEED_LINE_2_Y - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, SPEED_LINE_COLOR, 1)
+        
+        # Stop line
+        cv2.line(annotated, (0, STOP_LINE_Y), (frame_width, STOP_LINE_Y), 
+                STOP_LINE_COLOR, LINE_THICKNESS + 1)
+        cv2.putText(annotated, "STOP LINE", (10, STOP_LINE_Y - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, STOP_LINE_COLOR, 1)
+        
+        # Legend
+        legend_y = 30
+        cv2.putText(annotated, "VIRTUAL LINES:", (frame_width - 250, legend_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(annotated, "Cyan = Speed measurement", (frame_width - 250, legend_y + 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, SPEED_LINE_COLOR, 1)
+        cv2.putText(annotated, "Red = Stop line (red light)", (frame_width - 250, legend_y + 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, STOP_LINE_COLOR, 1)
+        
+        return annotated
+    
+    def draw_detections(self, frame, tracked, model_names):
+        """Draw bounding boxes, labels, and traces."""
+        if not self.show_overlay:
+            return frame
+            
+        labels = []
+        if tracked.tracker_id is not None:
+            for class_id, track_id in zip(tracked.class_id, tracked.tracker_id):
+                class_name = model_names[class_id]
+                labels.append(f"ID:{track_id} {class_name}")
+        
+        annotated = self.box_annotator.annotate(scene=frame, detections=tracked)
+        annotated = self.label_annotator.annotate(scene=annotated, detections=tracked, labels=labels)
+        
+        return annotated
