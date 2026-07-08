@@ -181,3 +181,146 @@ class OverlayRenderer:
         annotated = self.label_annotator.annotate(scene=annotated, detections=tracked, labels=labels)
         
         return annotated
+    
+    def draw_info_panel(self, frame, frame_num, active_tracks, total_ids, fps=None):
+        """Draw information panel on frame."""
+        if not self.show_overlay:
+            return frame
+            
+        info_lines = [
+            f"Frame: {frame_num}",
+            f"Active: {active_tracks}",
+            f"Total IDs: {total_ids}",
+        ]
+        if fps:
+            info_lines.append(f"FPS: {fps:.1f}")
+        
+        y_offset = 30
+        for line in info_lines:
+            cv2.putText(frame, line, (10, y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            y_offset += 25
+        
+        # Mode indicator
+        mode_text = "DEV MODE (overlay ON)" if self.show_overlay else "PROD MODE (overlay OFF)"
+        mode_color = (0, 255, 0) if self.show_overlay else (0, 165, 255)
+        cv2.putText(frame, mode_text, (10, frame.shape[0] - 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_color, 2)
+        
+        return frame
+
+
+def resize_for_display(frame, target_width=1280):
+    h, w = frame.shape[:2]
+    scale = target_width / w
+    new_h = int(h * scale)
+    return cv2.resize(frame, (target_width, new_h), interpolation=cv2.INTER_AREA)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Vehicle Detection Overlay System")
+    parser.add_argument("--no-overlay", action="store_true", 
+                       help="Disable visual overlay (production mode)")
+    args = parser.parse_args()
+    
+    show_overlay = not args.no_overlay
+    
+    print("=" * 60)
+    print("Epic 2 Complete: Detection Overlay System")
+    print("=" * 60)
+    print(f"Overlay mode: {'ON (development)' if show_overlay else 'OFF (production)'}")
+    print("-" * 60)
+    
+    model = YOLO(MODEL_PATH)
+    tracker = OcclusionTracker(frame_rate=30)
+    renderer = OverlayRenderer(show_overlay=show_overlay)
+    
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        print("ERROR: Cannot open video")
+        return
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    print(f"Video: {orig_w}x{orig_h} @ {fps:.1f} FPS | {total} frames")
+    print("-" * 60)
+    print("Controls: Q=quit, P=pause, O=toggle overlay")
+    print("=" * 60)
+    
+    frame_count = 0
+    paused = False
+    
+    while True:
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            frame_count += 1
+            
+            # Detection
+            results = model(frame, classes=VEHICLE_CLASSES, conf=CONFIDENCE, iou=IOU, verbose=False)
+            detections = sv.Detections.from_ultralytics(results[0])
+            tracked = tracker.update(detections, frame_count)
+            
+            # Overlay rendering
+            if show_overlay:
+                # Draw virtual lines first (behind detections)
+                frame = renderer.draw_virtual_lines(frame, orig_w)
+                
+                # Draw detections
+                frame = renderer.draw_detections(frame, tracked, model.names)
+                
+                # Draw info panel
+                active = len(tracked.tracker_id) if tracked.tracker_id is not None else 0
+                total_ids = tracker.next_consistent_id - 1
+                frame = renderer.draw_info_panel(frame, frame_count, active, total_ids)
+                
+                # Resize for display
+                display_frame = resize_for_display(frame, DISPLAY_WIDTH)
+                cv2.imshow("Vehicle Detection System", display_frame)
+            else:
+                # Production mode: no display, just process
+                if frame_count % 100 == 0:
+                    active = len(tracked.tracker_id) if tracked.tracker_id is not None else 0
+                    print(f"Frame {frame_count}: {active} active tracks")
+        
+        key = cv2.waitKey(1 if show_overlay else 30) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('p'):
+            paused = not paused
+        elif key == ord('o') and show_overlay:
+            # Toggle overlay on/off in real-time
+            show_overlay = not show_overlay
+            renderer.show_overlay = show_overlay
+            print(f"Overlay: {'ON' if show_overlay else 'OFF'}")
+    
+    cap.release()
+    if show_overlay:
+        cv2.destroyAllWindows()
+    
+    # Final report
+    print("\n" + "=" * 60)
+    print("EPIC 2 COMPLETE - SUMMARY")
+    print("=" * 60)
+    print(f"Frames processed: {frame_count}")
+    print(f"Total unique vehicles: {tracker.next_consistent_id - 1}")
+    print(f"Overlay mode: {'Development' if show_overlay else 'Production'}")
+    
+    print("\nEpic 2 Stories Completed:")
+    print("  TVS-4: YOLOv8 inference pipeline")
+    print("  TVS-5: Vehicle tracker with occlusion handling")
+    print("  TVS-6: Detection overlay with virtual lines")
+    
+    print("\nReady for Epic 3: Violation Detection Engine")
+    print("  - Speed estimation (virtual line timing)")
+    print("  - Red light crossing detection")
+    print("  - Violation rule engine")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    main()
