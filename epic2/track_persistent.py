@@ -1,10 +1,3 @@
-"""
-track_persistent.py
-TVS-5 Subtask 2: Persistent track IDs with updated supervision API.
-
-Usage: python track_persistent.py
-"""
-
 import cv2
 import supervision as sv
 from ultralytics import YOLO

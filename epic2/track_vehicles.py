@@ -1,10 +1,3 @@
-"""
-track_vehicles.py
-TVS-5 Subtask 1: Integrate ByteTrack for persistent vehicle IDs.
-
-Usage: python track_vehicles.py
-"""
-
 import cv2
 import supervision as sv
 from ultralytics import YOLO
