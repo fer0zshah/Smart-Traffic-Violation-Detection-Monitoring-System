@@ -53,3 +53,30 @@ class DetectionDebouncer:
             return True
 
         return False
+    # red_light_pipeline.py
+
+from red_light_core import RedLightConfig, RedLightDetector
+from debounce import DetectionDebouncer
+
+
+class RedLightPipeline:
+    def __init__(self):
+        self.config = RedLightConfig(
+            stop_line=((200, 500), (1000, 500)),
+            signal_state="RED"
+        )
+
+        self.detector = RedLightDetector(self.config)
+        self.debouncer = DetectionDebouncer(cooldown_frames=30)
+
+    def process(self, track_id, centroid, frame_number):
+        crossed = self.detector.check_crossing(track_id, centroid)
+
+        if crossed and self.debouncer.is_allowed(track_id, frame_number):
+            return {
+                "track_id": track_id,
+                "violation": "RED_LIGHT",
+                "frame": frame_number
+            }
+
+        return None
