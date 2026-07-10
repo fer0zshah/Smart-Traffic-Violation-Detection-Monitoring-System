@@ -17,11 +17,12 @@ DISPLAY_WIDTH = 1280
 
 
 # ===== detector.py =====
-
 class RedLightDetector:
-    def __init__(self, stop_line_y):
+    def __init__(self, stop_line_y, cooldown=60):
         self.stop_line_y = stop_line_y
+        self.cooldown = cooldown
         self.tracks = {}
+
         self.signal = "GREEN"
 
     def update_signal(self, signal):
@@ -31,22 +32,28 @@ class RedLightDetector:
         events = []
 
         for track_id, bottom_y in detections:
+
             if track_id not in self.tracks:
                 self.tracks[track_id] = {
-                    "last_y": bottom_y
+                    "last_y": bottom_y,
+                    "last_violation_frame": -999,
                 }
 
             track = self.tracks[track_id]
 
-            # Only check when RED
+            # cooldown check
+            if frame_num - track["last_violation_frame"] < self.cooldown:
+                track["last_y"] = bottom_y
+                continue
+
             if self.signal == "RED":
                 if bottom_y >= self.stop_line_y and track["last_y"] < self.stop_line_y:
-                    events.append(f"Track {track_id} crossed line at frame {frame_num}")
+                    events.append(f"Track {track_id} VIOLATION")
+                    track["last_violation_frame"] = frame_num
 
             track["last_y"] = bottom_y
 
         return events
-
 
 # ===== main.py =====
 
