@@ -1,0 +1,56 @@
+# ==========================
+# Laravel
+# ==========================
+/vendor/
+/node_modules/
+
+/public/build/
+/public/hot
+/public/storage
+
+/storage/*.key
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Cache files
+/.phpunit.cache/
+/.phpunit.result.cache
+
+# ==========================
+# Composer
+# ==========================
+auth.json
+
+# ==========================
+# Homestead
+# ==========================
+Homestead.json
+Homestead.yaml
+
+# ==========================
+# Logs
+# ==========================
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ==========================
+# IDEs & Editors
+# ==========================
+/.idea/
+/.vscode/
+/.fleet/
+
+# ==========================
+# OS Files
+# ==========================
+.DS_Store
+Thumbs.db
+
+# ==========================
+# Media
+# ==========================
+*.mp4
