@@ -14,7 +14,55 @@ IOU = 0.45
 
 # --- DISPLAY ---
 DISPLAY_WIDTH = 1280
+
+
+# ===== detector.py =====
+
+class RedLightDetector:
+    def __init__(self, stop_line_y):
+        self.stop_line_y = stop_line_y
+        self.tracks = {}
+        self.signal = "GREEN"
+
+    def update_signal(self, signal):
+        self.signal = signal
+
+    def process(self, detections, frame_num):
+        events = []
+
+        for track_id, bottom_y in detections:
+            if track_id not in self.tracks:
+                self.tracks[track_id] = {
+                    "last_y": bottom_y
+                }
+
+            track = self.tracks[track_id]
+
+            # Only check when RED
+            if self.signal == "RED":
+                if bottom_y >= self.stop_line_y and track["last_y"] < self.stop_line_y:
+                    events.append(f"Track {track_id} crossed line at frame {frame_num}")
+
+            track["last_y"] = bottom_y
+
+        return events
+
+
 # ===== main.py =====
+
+from config import STOP_LINE_Y
+from detector import RedLightDetector
+
+detector = RedLightDetector(STOP_LINE_Y)
+
+# simulate input
+detector.update_signal("RED")
+
+detections = [(1, 540), (1, 560)]  # crossing
+events = detector.process(detections, 10)
+
+print(events)
+
 from config import STOP_LINE_Y
 
 def main():
