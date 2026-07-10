@@ -757,6 +757,597 @@ class OcclusionTracker:
 
 
 
+#  TVS-9: VIOLATION RULE ENGINE
+#  Thin coordinator — owns both sub-detectors, applies cooldown,
+#  emits canonical ViolationEvent objects.
+
+
+class ViolationRuleEngine:
+    """
+    TVS-9: Combines speed (TVS-7) and red light (TVS-8) detectors.
+
+    Responsibilities:
+      1. Receive raw events from both detectors each frame
+      2. Apply per-(track, type) cooldown to prevent duplicate events
+      3. Emit canonical ViolationEvent objects with full metadata
+      4. Maintain a running log for downstream modules (plate crop, OCR, DB)
+
+    The engine owns NO detection logic — it only coordinates and enriches.
+    """
+
+    def __init__(self,
+                 speed_estimator:    SpeedEstimator,
+                 red_light_detector: RedLightDetector,
+                 speed_limit_kmh:    float,
+                 cooldown_frames:    int = COOLDOWN_FRAMES,
+                 evidence_pre:       int = EVIDENCE_PRE_FRAMES,
+                 evidence_post:      int = EVIDENCE_POST_FRAMES):
+
+        self.speed_est    = speed_estimator
+        self.rl_detector  = red_light_detector
+        self.speed_limit  = speed_limit_kmh
+        self.cooldown     = cooldown_frames
+        self.evidence_pre = evidence_pre
+        self.evidence_post = evidence_post
+
+        # Cooldown tracker: {(track_id, ViolationType): last_triggered_frame}
+        self._last_triggered: Dict[tuple, int] = {}
+
+        # All emitted events this session
+        self.events: List[ViolationEvent] = []
+        self._event_counter = 0
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _is_on_cooldown(self, tid: int, vtype: ViolationType,
+                        frame_num: int) -> bool:
+        key  = (tid, vtype)
+        last = self._last_triggered.get(key, -999999)
+        return (frame_num - last) <= self.cooldown
+
+    def _mark_triggered(self, tid: int, vtype: ViolationType,
+                        frame_num: int):
+        self._last_triggered[(tid, vtype)] = frame_num
+
+    def _make_event_id(self, tid: int, vtype: ViolationType,
+                       frame_num: int) -> str:
+        self._event_counter += 1
+        return f"{tid}_{vtype.value}_{frame_num}_{self._event_counter}"
+
+    def _emit(self,
+              tid:        int,
+              vtype:      ViolationType,
+              frame_num:  int,
+              direction:  str,
+              signal:     str,
+              speed_kmh:  Optional[float],
+              bbox:       list) -> ViolationEvent:
+
+        event = ViolationEvent(
+            event_id             = self._make_event_id(tid, vtype, frame_num),
+            track_id             = tid,
+            violation_type       = vtype,
+            frame_number         = frame_num,
+            timestamp            = datetime.now().isoformat(),
+            direction            = direction,
+            signal_state         = signal,
+            speed_kmh            = speed_kmh,
+            speed_limit_kmh      = self.speed_limit if vtype == ViolationType.OVERSPEED else None,
+            bbox                 = [round(v, 1) for v in bbox],
+            evidence_start_frame = max(0, frame_num - self.evidence_pre),
+            evidence_end_frame   = frame_num + self.evidence_post,
+        )
+        self.events.append(event)
+        self._mark_triggered(tid, vtype, frame_num)
+        return event
+
+    # ── Main per-frame update ─────────────────────────────────────────────────
+
+    def update(self,
+               detections: sv.Detections,
+               signal:     SignalState,
+               frame_num:  int) -> List[ViolationEvent]:
+        """
+        Call once per frame with the current detections and signal state.
+        Returns list of new ViolationEvents emitted this frame.
+        """
+        new_events: List[ViolationEvent] = []
+
+        # --- Run sub-detectors ---
+        speed_events = self.speed_est.process(detections, frame_num)
+        rl_events    = self.rl_detector.process(detections, signal, frame_num)
+
+        # --- Process speed violations ---
+        for se in speed_events:
+            if not se["violation"]:
+                continue
+            tid   = se["track_id"]
+            vtype = ViolationType.OVERSPEED
+            if self._is_on_cooldown(tid, vtype, frame_num):
+                continue
+            ev = self._emit(
+                tid       = tid,
+                vtype     = vtype,
+                frame_num = se.get("frame_num", frame_num),
+                direction = se["direction"],
+                signal    = signal.value,
+                speed_kmh = se["speed_kmh"],
+                bbox      = se.get("bbox", [0, 0, 0, 0]),
+            )
+            new_events.append(ev)
+            print(f"  [RULE ENGINE] Frame {frame_num}: OVERSPEED — "
+                  f"Vehicle #{tid} @ {se['speed_kmh']} km/h  "
+                  f"[event_id={ev.event_id}]")
+
+        # --- Process red light violations ---
+        for rle in rl_events:
+            tid   = rle["track_id"]
+            vtype = ViolationType.RED_LIGHT
+            if self._is_on_cooldown(tid, vtype, frame_num):
+                continue
+
+            # Enrich with speed if we happen to have it
+            speed = self.speed_est.get_speed(tid)
+
+            ev = self._emit(
+                tid       = tid,
+                vtype     = vtype,
+                frame_num = rle["frame"],
+                direction = rle.get("direction", "unknown"),
+                signal    = rle.get("signal_state", "RED"),
+                speed_kmh = speed,
+                bbox      = rle.get("bbox", [0, 0, 0, 0]),
+            )
+            new_events.append(ev)
+            print(f"  [RULE ENGINE] Frame {frame_num}: RED_LIGHT — "
+                  f"Vehicle #{tid} direction={rle.get('direction', '?')}  "
+                  f"[event_id={ev.event_id}]")
+
+        return new_events
+
+    # ── Accessors ─────────────────────────────────────────────────────────────
+
+    def get_events_for_track(self, tid: int) -> List[ViolationEvent]:
+        return [e for e in self.events if e.track_id == tid]
+
+    def get_events_by_type(self, vtype: ViolationType) -> List[ViolationEvent]:
+        return [e for e in self.events if e.violation_type == vtype]
+
+    def get_summary(self) -> dict:
+        overspeed = self.get_events_by_type(ViolationType.OVERSPEED)
+        red_light = self.get_events_by_type(ViolationType.RED_LIGHT)
+        combined  = [tid for tid in {e.track_id for e in overspeed}
+                     if any(e.track_id == tid for e in red_light)]
+        return {
+            "total_events":    len(self.events),
+            "overspeed_count": len(overspeed),
+            "red_light_count": len(red_light),
+            "combined_count":  len(combined),
+            "unique_vehicles": len({e.track_id for e in self.events}),
+            "cooldown_frames": self.cooldown,
+            "speed_limit_kmh": self.speed_limit,
+            "events": [e.to_dict() for e in self.events],
+        }
+
+
+
+#  DRAWING / HUD
+
+
+DIR_COLORS = {
+    Direction.UP:      (255, 200, 0),     # cyan-ish
+    Direction.DOWN:    (0, 165, 255),      # orange
+    Direction.UNKNOWN: (160, 160, 160),    # grey
+}
+DIR_ARROWS = {
+    Direction.UP:      "↑",
+    Direction.DOWN:    "↓",
+    Direction.UNKNOWN: "?",
+}
+
+
+def draw_hud(frame, frame_num: int, engine: ViolationRuleEngine,
+             tracked, signal: SignalState, orig_w: int, orig_h: int):
+    """Draw combined overlays: speed zone + stop line + traffic light + summary."""
+
+    # Speed zone shading
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, LINE_UPPER_Y), (orig_w, LINE_LOWER_Y),
+                  (255, 255, 0), -1)
+    frame[:] = cv2.addWeighted(frame, 0.85, overlay, 0.15, 0)
+
+    # Speed lines
+    cv2.line(frame, (0, LINE_UPPER_Y), (orig_w, LINE_UPPER_Y), (0, 0, 255), 2)
+    cv2.putText(frame, f"UPPER LINE (Y={LINE_UPPER_Y})",
+                (10, LINE_UPPER_Y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1)
+    cv2.line(frame, (0, LINE_LOWER_Y), (orig_w, LINE_LOWER_Y), (0, 255, 0), 2)
+    cv2.putText(frame, f"LOWER LINE (Y={LINE_LOWER_Y})",
+                (10, LINE_LOWER_Y + 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+
+    # Stop line
+    sl_color     = (0, 0, 255) if signal == SignalState.RED else (180, 180, 180)
+    sl_thickness = 4           if signal == SignalState.RED else 2
+    cv2.line(frame, (0, STOP_LINE_Y), (orig_w, STOP_LINE_Y), sl_color, sl_thickness)
+    cv2.putText(frame, f"STOP LINE (Y={STOP_LINE_Y})",
+                (10, STOP_LINE_Y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, sl_color, 2)
+
+    # Direction indicators
+    mid_y = (LINE_UPPER_Y + LINE_LOWER_Y) // 2
+    cv2.putText(frame, "UP "+chr(8593), (50, mid_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(frame, chr(8595)+" DOWN", (orig_w - 180, mid_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    # Traffic light widget
+    lx, ly = orig_w - 110, 30
+    cv2.rectangle(frame, (lx - 15, ly - 10), (lx + 75, ly + 110), (40, 40, 40), -1)
+    cv2.rectangle(frame, (lx - 15, ly - 10), (lx + 75, ly + 110), (180, 180, 180), 2)
+    for idx, st in enumerate([SignalState.RED, SignalState.YELLOW, SignalState.GREEN]):
+        cy_ = ly + 15 + idx * 32
+        col = {SignalState.RED: (0,0,255), SignalState.YELLOW: (0,255,255),
+               SignalState.GREEN: (0,255,0)}[st]
+        if st == signal:
+            cv2.circle(frame, (lx + 30, cy_), 13, col, -1)
+            cv2.circle(frame, (lx + 30, cy_), 13, (255, 255, 255), 2)
+        else:
+            cv2.circle(frame, (lx + 30, cy_), 13, (50, 50, 50), -1)
+    cv2.putText(frame, signal.value, (lx - 10, ly + 118),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                {SignalState.GREEN: (0,255,0), SignalState.YELLOW: (0,255,255),
+                 SignalState.RED: (0,0,255)}[signal], 2)
+
+    if USE_KEYBOARD:
+        cv2.putText(frame, "R/Y/G=signal  Q=quit  P=pause",
+                    (10, orig_h - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+
+    # Violation flash overlay for recent events
+    recent = [e for e in engine.events
+              if frame_num - e.frame_number <= EVIDENCE_POST_FRAMES]
+    if recent:
+        flash_overlay = frame.copy()
+        cv2.rectangle(flash_overlay, (0, 0), (orig_w, orig_h), (0, 0, 180), -1)
+        frame[:] = cv2.addWeighted(frame, 0.92, flash_overlay, 0.08, 0)
+
+    # Summary box
+    summary = engine.get_summary()
+    cv2.rectangle(frame, (8, 8), (460, 80), (0, 0, 0), -1)
+    cv2.rectangle(frame, (8, 8), (460, 80), (80, 80, 80), 1)
+    active = len(tracked.tracker_id) if tracked.tracker_id is not None else 0
+    cv2.putText(frame,
+                f"Frame:{frame_num} | Active:{active} | Signal:{signal.value}",
+                (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+    cv2.putText(frame,
+                f"Violations: {summary['total_events']}  "
+                f"(Speed:{summary['overspeed_count']}  "
+                f"Red:{summary['red_light_count']}  "
+                f"Both:{summary['combined_count']})",
+                (14, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 1)
+    cv2.putText(frame,
+                f"Unique vehicles: {summary['unique_vehicles']}",
+                (14, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+
+def draw_direction_indicators(frame, tracked, rl_detector: RedLightDetector):
+    """Draw a small colored arrow on each vehicle box indicating detected direction."""
+    if tracked.tracker_id is None:
+        return
+    for i, track_id in enumerate(tracked.tracker_id):
+        direction = rl_detector.get_direction(track_id)
+        color     = DIR_COLORS[direction]
+        x1, y1, x2, y2 = tracked.xyxy[i]
+        cx = int((x1 + x2) / 2)
+        if direction == Direction.UP:
+            cv2.arrowedLine(frame, (cx, int(y1) + 20), (cx, int(y1) - 5),
+                            color, 2, tipLength=0.4)
+        elif direction == Direction.DOWN:
+            cv2.arrowedLine(frame, (cx, int(y1) - 5), (cx, int(y1) + 20),
+                            color, 2, tipLength=0.4)
+
+
+def build_labels(tracked, engine: ViolationRuleEngine, model) -> list:
+    labels = []
+    if tracked.tracker_id is None:
+        return labels
+    for class_id, tid in zip(tracked.class_id, tracked.tracker_id):
+        name      = model.names[class_id]
+        speed     = engine.speed_est.get_speed(tid)
+        direction = engine.speed_est.get_direction(tid)
+        arrow     = "↑" if direction == "up" else "↓" if direction == "down" else "?"
+        evs       = engine.get_events_for_track(tid)
+        types     = {e.violation_type for e in evs}
+
+        parts = [f"#{tid}", arrow, name]
+        if speed is not None:
+            parts.append(f"{speed}km/h")
+        if ViolationType.OVERSPEED in types:
+            parts.append("[!SPEED]")
+        if ViolationType.RED_LIGHT in types:
+            parts.append("[!RED]")
+        labels.append(" ".join(parts))
+    return labels
+
+
+def resize_for_display(frame, target_width=1280):
+    h, w = frame.shape[:2]
+    scale = target_width / w
+    return cv2.resize(frame, (target_width, int(h * scale)),
+                      interpolation=cv2.INTER_AREA)
+
+
+
+#  UNIT TESTS
+
+
+class TestViolationRuleEngine(unittest.TestCase):
+
+    def _make_engine(self, cooldown=COOLDOWN_FRAMES):
+        se  = SpeedEstimator(LINE_UPPER_Y, LINE_LOWER_Y,
+                             REAL_DISTANCE_METERS, VIDEO_FPS, SPEED_LIMIT_KMH)
+        rld = RedLightDetector(STOP_LINE_Y)
+        return ViolationRuleEngine(se, rld, SPEED_LIMIT_KMH,
+                                   cooldown_frames=cooldown)
+
+    def _make_det(self, tid, x1, y1, x2, y2):
+        """Build a minimal sv.Detections mock."""
+        import numpy as np
+        d = sv.Detections(
+            xyxy       = np.array([[x1, y1, x2, y2]], dtype=float),
+            confidence = np.array([0.9]),
+            class_id   = np.array([2]),
+            tracker_id = np.array([tid]),
+        )
+        return d
+
+    def test_cooldown_prevents_duplicate(self):
+        """Same (track, type) within cooldown window must not emit twice."""
+        engine = self._make_engine()
+        engine._emit(1, ViolationType.OVERSPEED, 100, "up", "GREEN", 80.0,
+                     [0, 0, 50, 50])
+        # Frame 110 — within cooldown (90 frames)
+        on_cd = engine._is_on_cooldown(1, ViolationType.OVERSPEED, 110)
+        self.assertTrue(on_cd)
+        self.assertEqual(len(engine.events), 1)
+
+    def test_cooldown_expires(self):
+        """After cooldown, same track can emit again."""
+        engine = self._make_engine()
+        engine._emit(1, ViolationType.OVERSPEED, 100, "up", "GREEN", 80.0,
+                     [0, 0, 50, 50])
+        # Frame 100 + 91 = 191 — past cooldown
+        on_cd = engine._is_on_cooldown(1, ViolationType.OVERSPEED, 191)
+        self.assertFalse(on_cd)
+
+    def test_different_types_independent_cooldown(self):
+        """OVERSPEED and RED_LIGHT cooldowns are independent per track."""
+        engine = self._make_engine()
+        engine._emit(1, ViolationType.OVERSPEED, 100, "up", "GREEN", 80.0,
+                     [0, 0, 50, 50])
+        engine._emit(1, ViolationType.RED_LIGHT, 100, "up", "RED", None,
+                     [0, 0, 50, 50])
+        self.assertEqual(len(engine.events), 2)
+        # Both are on cooldown individually
+        self.assertTrue(engine._is_on_cooldown(1, ViolationType.OVERSPEED, 150))
+        self.assertTrue(engine._is_on_cooldown(1, ViolationType.RED_LIGHT, 150))
+
+    def test_different_tracks_independent(self):
+        """Cooldown on track 1 must not affect track 2."""
+        engine = self._make_engine()
+        engine._emit(1, ViolationType.OVERSPEED, 100, "up", "GREEN", 80.0,
+                     [0, 0, 50, 50])
+        on_cd = engine._is_on_cooldown(2, ViolationType.OVERSPEED, 110)
+        self.assertFalse(on_cd)
+
+    def test_event_fields(self):
+        """ViolationEvent must carry all required fields for downstream modules."""
+        engine = self._make_engine()
+        ev = engine._emit(5, ViolationType.RED_LIGHT, 200, "down", "RED",
+                          None, [10, 20, 60, 80])
+        self.assertEqual(ev.track_id, 5)
+        self.assertEqual(ev.violation_type, ViolationType.RED_LIGHT)
+        self.assertEqual(ev.frame_number, 200)
+        self.assertEqual(ev.evidence_start_frame, 200 - EVIDENCE_PRE_FRAMES)
+        self.assertEqual(ev.evidence_end_frame, 200 + EVIDENCE_POST_FRAMES)
+        self.assertIsNone(ev.speed_kmh)
+        self.assertEqual(ev.plate_number, "")  # unfilled until TVS-10
+
+    def test_event_id_unique(self):
+        """Every emitted event must have a unique event_id."""
+        engine = self._make_engine()
+        ids = [
+            engine._emit(i, ViolationType.OVERSPEED, 100 + i, "up", "G",
+                         80.0, [0, 0, 1, 1]).event_id
+            for i in range(10)
+        ]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_summary_counts(self):
+        """Summary must correctly count by type and unique vehicles."""
+        engine = self._make_engine()
+        engine._emit(1, ViolationType.OVERSPEED, 100, "up", "G", 80.0,
+                     [0, 0, 1, 1])
+        engine._emit(2, ViolationType.RED_LIGHT, 200, "up", "R", None,
+                     [0, 0, 1, 1])
+        engine._emit(3, ViolationType.OVERSPEED, 300, "up", "G", 90.0,
+                     [0, 0, 1, 1])
+        engine._emit(3, ViolationType.RED_LIGHT, 300, "up", "R", 90.0,
+                     [0, 0, 1, 1])
+        s = engine.get_summary()
+        self.assertEqual(s["total_events"],    4)
+        self.assertEqual(s["overspeed_count"], 2)
+        self.assertEqual(s["red_light_count"], 2)
+        self.assertEqual(s["combined_count"],  1)   # vehicle #3
+        self.assertEqual(s["unique_vehicles"], 3)
+
+    def test_to_dict_serializable(self):
+        """ViolationEvent.to_dict() must produce JSON-serializable output."""
+        engine = self._make_engine()
+        ev = engine._emit(1, ViolationType.OVERSPEED, 100, "up", "G", 80.0,
+                          [0, 0, 50, 80])
+        d = ev.to_dict()
+        json.dumps(d)  # must not raise
+
+
+
+#  MAIN
+
+
+def main():
+    import sys
+    if "--test" in sys.argv:
+        print("Running TVS-9 unit tests...")
+        suite  = unittest.TestLoader().loadTestsFromTestCase(TestViolationRuleEngine)
+        runner = unittest.TextTestRunner(verbosity=2)
+        result = runner.run(suite)
+        return 0 if result.wasSuccessful() else 1
+
+    print("=" * 60)
+    print("TVS-9: Violation Rule Engine")
+    print("  Speed Estimation (TVS-7) + Red Light Detection (TVS-8)")
+    print("=" * 60)
+    print(f"Speed zone    : Y={LINE_UPPER_Y} (upper) to Y={LINE_LOWER_Y} (lower)")
+    print(f"Real distance : {REAL_DISTANCE_METERS} m")
+    print(f"Speed limit   : {SPEED_LIMIT_KMH} km/h")
+    print(f"Stop line     : Y={STOP_LINE_Y}")
+    print(f"Cooldown      : {COOLDOWN_FRAMES} frames")
+    print(f"Evidence clip : -{EVIDENCE_PRE_FRAMES} / +{EVIDENCE_POST_FRAMES} frames")
+    print(f"Signal mode   : {'KEYBOARD (R/Y/G)' if USE_KEYBOARD else 'AUTO CYCLE'}")
+    print(f"FPS           : {VIDEO_FPS}")
+    print("-" * 60)
+
+    model   = YOLO(MODEL_PATH)
+    tracker = OcclusionTracker(frame_rate=VIDEO_FPS)
+    light   = TrafficLight()
+
+    speed_est = SpeedEstimator(
+        LINE_UPPER_Y, LINE_LOWER_Y,
+        REAL_DISTANCE_METERS, VIDEO_FPS, SPEED_LIMIT_KMH
+    )
+    rl_det = RedLightDetector(STOP_LINE_Y)
+    engine = ViolationRuleEngine(speed_est, rl_det, SPEED_LIMIT_KMH)
+
+    box_annotator   = sv.BoxAnnotator(thickness=2)
+    label_annotator = sv.LabelAnnotator(text_thickness=2, text_scale=0.55)
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        print("ERROR: Cannot open video:", VIDEO_PATH)
+        return
+
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Video         : {orig_w}x{orig_h}")
+    print("Controls      : Q=quit  P=pause  R=Red  Y=Yellow  G=Green")
+    print("=" * 60)
+
+    frame_count = 0
+    paused      = False
+
+    while True:
+        # Key read FIRST — used for signal update this same frame
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+        elif key == ord("p"):
+            paused = not paused
+            print("  [PAUSED]" if paused else "  [RESUMED]")
+
+        if USE_KEYBOARD:
+            if key in (ord('r'), ord('y'), ord('g')):
+                light.set_state(key)
+        else:
+            if not paused:
+                light.auto_update(frame_count)
+
+        if paused:
+            continue
+
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_count += 1
+
+        # Detection & tracking
+        results    = model(frame, classes=VEHICLE_CLASSES,
+                           conf=CONFIDENCE, iou=IOU, verbose=False)
+        detections = sv.Detections.from_ultralytics(results[0])
+        tracked, _ = tracker.update(detections, frame_count)
+
+        # ── Single call to the rule engine ────────────────────────────────
+        new_events = engine.update(tracked, light.state, frame_count)
+
+        # Draw scene
+        annotated = frame.copy()
+        draw_hud(annotated, frame_count, engine, tracked,
+                 light.state, orig_w, orig_h)
+        draw_direction_indicators(annotated, tracked, engine.rl_detector)
+
+        labels    = build_labels(tracked, engine, model)
+        annotated = box_annotator.annotate(scene=annotated, detections=tracked)
+        annotated = label_annotator.annotate(scene=annotated,
+                                              detections=tracked,
+                                              labels=labels)
+
+        display = resize_for_display(annotated, DISPLAY_WIDTH)
+        cv2.imshow("TVS-9 Violation Rule Engine", display)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    # ── Final Report ──────────────────────────────────────────────────────
+    summary = engine.get_summary()
+    speed_summary = engine.speed_est.get_summary()
+    rl_summary    = engine.rl_detector.get_summary()
+
+    print("\n" + "=" * 60)
+    print("TVS-9 VIOLATION RULE ENGINE — FINAL REPORT")
+    print("=" * 60)
+    print(f"Total events      : {summary['total_events']}")
+    print(f"  Overspeed       : {summary['overspeed_count']}")
+    print(f"  Red light       : {summary['red_light_count']}")
+    print(f"  Both types      : {summary['combined_count']}")
+    print(f"Unique vehicles   : {summary['unique_vehicles']}")
+
+    print(f"\nSpeed measurements: {speed_summary['total_valid']} "
+          f"(UP: {speed_summary['up_count']}, DOWN: {speed_summary['down_count']})")
+    print(f"  Discarded       : {speed_summary['discarded']}")
+    print(f"  Average speed   : {speed_summary['average_speed']} km/h")
+    print(f"  Calibration     : {speed_summary['pixels_per_meter']} px/m")
+
+    print(f"\nRed light hits    : {rl_summary['total_violations']} "
+          f"(UP: {rl_summary['up_violations']}, DOWN: {rl_summary['down_violations']})")
+
+    if summary["events"]:
+        print("\nEvent log:")
+        for e in summary["events"]:
+            speed_str = f"{e['speed_kmh']} km/h" if e["speed_kmh"] else "N/A"
+            print(f"  [{e['event_id']}]  "
+                  f"Frame {e['frame_number']:>5}  "
+                  f"Vehicle #{e['track_id']:>3}  "
+                  f"{e['violation_type']:<10}  "
+                  f"speed={speed_str:<12}  "
+                  f"dir={e['direction']:<5}  "
+                  f"signal={e['signal_state']}")
+            print(f"           evidence frames: "
+                  f"{e['evidence_start_frame']} -> {e['evidence_end_frame']}")
+
+    # Save combined JSON report
+    combined_report = {
+        "rule_engine": summary,
+        "speed_estimation": speed_summary,
+        "red_light_detection": rl_summary,
+    }
+    out = "violation_events.json"
+    with open(out, "w") as f:
+        json.dump(combined_report, f, indent=2)
+    print(f"\nSaved: {out}")
+    print("Run with --test flag to execute unit tests.")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
     main()
