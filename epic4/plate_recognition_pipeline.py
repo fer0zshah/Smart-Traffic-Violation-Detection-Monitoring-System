@@ -38,4 +38,18 @@ class RedLightDetector:
 
         # Crossing detection
         return prev_side * curr_side < 0
-    
+    # debounce.py
+
+class DetectionDebouncer:
+    def __init__(self, cooldown_frames: int = 30):
+        self.cooldown_frames = cooldown_frames
+        self.last_trigger_frame = {}
+
+    def is_allowed(self, track_id: int, current_frame: int) -> bool:
+        last_frame = self.last_trigger_frame.get(track_id, -9999)
+
+        if current_frame - last_frame >= self.cooldown_frames:
+            self.last_trigger_frame[track_id] = current_frame
+            return True
+
+        return False
