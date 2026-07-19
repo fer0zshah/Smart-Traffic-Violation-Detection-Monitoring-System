@@ -8,9 +8,7 @@ use Symfony\Component\HttpFoundation\Response;
 
 class RequireRole
 {
-    /**
-     * Restrict a route to one or more comma-separated application roles.
-     */
+
     public function handle(Request $request, Closure $next, string ...$roles): Response
     {
         abort_unless(
