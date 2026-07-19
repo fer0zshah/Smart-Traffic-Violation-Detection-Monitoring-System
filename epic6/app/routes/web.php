@@ -10,10 +10,14 @@ Route::get('/', function () {
         ? redirect()->route('dashboard')
         : redirect()->route('login');
 });
-
+// Route::get('/dashboard', function () {
+//     return view('dashboard');
+// })->middleware(['auth', 'verified'])->name('dashboard');
 Route::get('/dashboard', DashboardController::class)
     ->middleware(['auth', 'role:admin,officer'])
     ->name('dashboard');
+
+// Route::get('/admin', function () {       
 
 Route::view('/admin', 'admin.index')
     ->middleware(['auth', 'role:admin'])
